@@ -1521,7 +1521,7 @@ def model_interpretability(model, X_test, y_test, save_filename):
             combined_data = pickle.load(file)
         explainer = combined_data["explainer"]
         shap_values = combined_data["shap_values"]
-        print(f"Loaded saved shap variables for {model_name}")
+        print(f"Loaded saved shap variables for stacked model from {save_filename}")
     except:
         # Define a wrapper for the model's predict function
         def model_predict(data):

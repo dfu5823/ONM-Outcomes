@@ -932,88 +932,260 @@ def get_overlapping_indices(*index_arrays, overlap_mode="all_overlap"):
         else:
             raise ValueError("Invalid overlap_mode. Accepted values are 'all_overlap' or 'two_overlap'.")
 
-def feature_reduction(use_lasso,use_rfe,use_rf,use_boruta,X_train,X_test,y_train,y_test,overlap_mode="all_overlap"):
-    print('\n')
-    print(f'There are {X_train.shape[1]} features in the training data.')
+import re
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from group_lasso import GroupLasso
 
-    if use_lasso or use_rfe or use_rf or use_boruta:
-        lasso_support_indices = []
-        rfe_support_indices = []
-        rf_support_indices = []
-        boruta_support_indices = []
+def feature_reduction(use_lasso, use_rfe, use_rf, use_boruta,
+                      X_train, X_test, y_train, y_test, overlap_mode="all_overlap"):
+    """
+    Group-aware feature reduction with target <50 groups.
+      - use_lasso: Group Lasso
+      - use_rfe:   Sparse Group Lasso (group lasso + small L1)
+      - use_rf:    Grouped Random Forest
+    Auto-detects groups from column names and returns X_train, X_test restricted to selected groups.
+    """
 
-        # Use Lasso for feature reduction (only use features with non-zero coefficients)
-        if use_lasso:
-            cv = KFold(n_splits=5, shuffle=True, random_state=42)
-            lasso = LassoCV(cv=cv).fit(X_train, y_train)
-            coef = lasso.coef_
-            important_features_indices = np.where(coef != 0)[0]
-            # If X_train is a pandas DataFrame
-            if isinstance(X_train, pd.DataFrame):
-                X_lasso = X_train.iloc[:, important_features_indices]
-            else:  # Assuming X_train is a numpy array
-                X_lasso = X_train[:, important_features_indices]
-            lasso_support_indices = np.where(lasso.coef_ != 0)[0]
+    # --- knobs you can tweak ---
+    TARGET_GROUPS = 50        # final number cap
+    MIN_GROUPS    = 10        # don't go below this
+    ALPHA_GL      = 0.05      # group penalty strength
+    L1_RATIO_SGL  = 0.15      # >0 makes it sparse group lasso
+    RF_N_EST      = 800
+    RF_CUM_THR    = 0.50      # cumulative importance threshold (before top-K fallback)
+    # ---------------------------
 
-            print('\n')
-            print(f'Lasso regression selected {X_lasso.shape[1]} important features in the training data.')
+    def _ensure_df(X):
+        return X.copy() if isinstance(X, pd.DataFrame) else pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
 
-        # Use Recursive Feature Elimination for feature reduction to a pre-set number of genes
-        if use_rfe:
-            model = LinearRegression()
-            number_of_rfe_genes_to_keep = 100
-            rfe = RFE(model, n_features_to_select=number_of_rfe_genes_to_keep)
-            rfe.fit(X_train, y_train)
-            X_rfe = X_train[:, rfe.support_]
-            rfe_support_indices = np.where(rfe.support_)[0]
+    def _infer_group(col: str) -> str:
+        c = re.sub(r"\s+", "_", str(col)).replace(".", "_").strip()
+        if "_" not in c: return c
+        parts = c.split("_")
+        last = parts[-1].lower()
+        if re.fullmatch(r"(?:p|c)?[0-9a-z]+", last) or last == "nan":
+            base = "_".join(parts[:-1])
+            return base if base else c
+        return "_".join(parts[:-1]) if len(parts) > 1 else c
 
-            print('\n')
-            print(f'Recursive feature elimination (RFE) eliminated  all but {X_rfe.shape[1]} important features in the training data.')
+    def _build_groups(cols):
+        groups = {}
+        for i, c in enumerate(cols):
+            g = _infer_group(c)
+            groups.setdefault(g, []).append(i)
+        return groups  # {group_name: [col_idx,...]}
 
-        # Use Random Forest for feature reduction (select the n most important genes)
-        if use_rf:
-            total_rf_feature_importance = 0.5
-            rf = RandomForestClassifier(n_estimators=1000, random_state=42)
-            rf.fit(X_train, y_train)
+    def _group_lasso_scores(Xdf, y, groups, alpha, l1_ratio):
+        # returns group -> continuous score (L2 norm of coefficients)
+        gnames = list(groups.keys())
+        gassign = np.zeros(Xdf.shape[1], dtype=int)
+        for gi, g in enumerate(gnames):
+            for j in groups[g]: gassign[j] = gi
+        Xs = StandardScaler().fit_transform(Xdf.values)
+        gl = GroupLasso(groups=gassign, group_reg=alpha, l1_reg=alpha*l1_ratio,
+                        frobenius_lipschitz=True, scale_reg="group_size",
+                        supress_warning=True, n_iter=2000, tol=1e-4, fit_intercept=True)
+        gl.fit(Xs, y)
+        b = gl.coef_.ravel()
+        return {g: float(np.linalg.norm(b[groups[g]], 2)) for g in gnames}
 
-            # Get feature importances and calculate the cumulative sum
-            importances = rf.feature_importances_
-            cumsum_importances = np.cumsum(np.sort(importances)[::-1])
+    def _rf_group_importance(Xdf, y, groups):
+        rf = RandomForestClassifier(n_estimators=RF_N_EST, random_state=42, n_jobs=-1)
+        rf.fit(Xdf, y)
+        fi = rf.feature_importances_
+        return {g: float(fi[groups[g]].sum()) for g in groups}
 
-            # Get the indices that would sort the importances array
-            sorted_indices = np.argsort(importances)[::-1]
+    def _normalize(d):
+        if not d: return d
+        vals = np.array(list(d.values()), dtype=float)
+        m, M = vals.min(), vals.max()
+        if M <= 0 or np.isclose(M, m):  # all zeros or constant
+            return {k: 0.0 for k in d}
+        return {k: float((v - m) / (M - m)) for k, v in d.items()}
 
-            # Get the indices for the features that make up 50% of the importance
-            rf_support_indices = sorted_indices[:np.where(cumsum_importances > total_rf_feature_importance)[0][0]]
+    def _rank_topk(score_dict, topk):
+        ordered = sorted(score_dict.items(), key=lambda kv: kv[1], reverse=True)
+        return [g for g, _ in ordered[:topk]]
 
-            print(f'\nRandom Forest selected {len(rf_support_indices)} important features in the training data with total {total_rf_feature_importance*100}% feature importance.')
+    def _flatten_indices(groups, chosen_groups):
+        keep = []
+        for g in chosen_groups:
+            keep.extend(groups[g])
+        return sorted(set(keep))
 
-        # Use Boruta for feature reduction (select the n most important genes)
-        if use_boruta:
-            z_score_threshold = 50
-            rf = RandomForestClassifier(n_jobs=-1, class_weight='balanced', max_depth=5, random_state=42)
-            boruta_selector = BorutaPy(rf, n_estimators='auto', verbose=2, random_state=42, perc=z_score_threshold)   
-            boruta_selector.fit(X_train, y_train)
+    # ---- main ----
+    Xtr, Xte = _ensure_df(X_train), _ensure_df(X_test)
+    print(f"\nThere are {Xtr.shape[1]} features in the training data.")
+    groups = _build_groups(Xtr.columns)
+    print(f"Auto-detected {len(groups)} variable groups.")
 
-            boruta_support_indices = np.where(boruta_selector.support_)[0]
+    if not (use_lasso or use_rfe or use_rf):
+        print("\nNo methods selected; returning original matrices.")
+        return X_train, X_test
 
-            print(f'\nBoruta selected {len(boruta_support_indices)} important features in the training data at {z_score_threshold} z-score threshold difference.')
+    # 1) get per-method group scores
+    method_scores = []  # list of {group: normalized_score}
+    hard_sets = []      # list of sets for overlap_mode
 
-        common_indices = get_overlapping_indices(rfe_support_indices, lasso_support_indices, rf_support_indices, boruta_support_indices, overlap_mode=overlap_mode)
+    if use_lasso:
+        s_gl = _normalize(_group_lasso_scores(Xtr, y_train, groups, alpha=ALPHA_GL, l1_ratio=0.0))
+        method_scores.append(s_gl)
+        hard_sets.append({g for g, v in s_gl.items() if v > 0})
 
-        print('\n')
-        print(f'After combining overlapping reduced features from multiple methods, {len(common_indices)} features remain.')
+    if use_rfe:
+        s_sgl = _normalize(_group_lasso_scores(Xtr, y_train, groups, alpha=ALPHA_GL, l1_ratio=L1_RATIO_SGL))
+        method_scores.append(s_sgl)
+        hard_sets.append({g for g, v in s_sgl.items() if v > 0})
 
-        if isinstance(X_train, pd.DataFrame):
-            X_train = X_train.iloc[:, common_indices]
-            X_test = X_test.iloc[:, common_indices]
+    if use_rf:
+        s_rf = _normalize(_rf_group_importance(Xtr, y_train, groups))
+        # quick pre-cut by cumulative importance (optional)
+        if any(v > 0 for v in s_rf.values()):
+            ordered = sorted(s_rf.items(), key=lambda kv: kv[1], reverse=True)
+            cum, keep = 0.0, []
+            for g, v in ordered:
+                cum += v
+                keep.append(g)
+                if cum >= RF_CUM_THR: break
+            hard_sets.append(set(keep))
+        method_scores.append(s_rf)
+
+    # 2) try strict overlap if requested
+    if hard_sets:
+        if overlap_mode == "all_overlap":
+            hard = set.intersection(*hard_sets) if all(hard_sets) else set()
         else:
-            X_train = X_train[:, common_indices]
-            X_test = X_test[:, common_indices]
-        print('\n')
-        print(f'X_train and X_test now have {X_train.shape[1]} features each from the feature reduction.')
+            hard = set.union(*hard_sets)
+    else:
+        hard = set()
+
+    # 3) build a consensus score (mean of normalized scores across available methods)
+    consensus = defaultdict(float)
+    counts = defaultdict(int)
+    for sd in method_scores:
+        for g, v in sd.items():
+            consensus[g] += v
+            counts[g] += 1
+    for g in list(consensus.keys()):
+        consensus[g] /= max(1, counts[g])
+
+    # 4) choose final groups:
+    chosen = []
+    if hard:
+        # rank hard set by consensus and cap to TARGET_GROUPS
+        hard_ranked = _rank_topk({g: consensus.get(g, 0.0) for g in hard}, topk=max(TARGET_GROUPS, MIN_GROUPS))
+        chosen = hard_ranked[:TARGET_GROUPS]
+    else:
+        # fallback: global top-K by consensus (ensures <50 groups)
+        chosen = _rank_topk(consensus, topk=max(TARGET_GROUPS, MIN_GROUPS))
+
+    # pad up to MIN_GROUPS if needed
+    if len(chosen) < MIN_GROUPS:
+        extras = [g for g in _rank_topk(consensus, topk=MIN_GROUPS) if g not in chosen]
+        chosen = chosen + extras
+    # cap to TARGET_GROUPS
+    chosen = chosen[:TARGET_GROUPS]
+
+    print(f'\nSelected {len(chosen)} groups (target {TARGET_GROUPS}).')
+
+    keep_idx = _flatten_indices(groups, chosen)
+    Xtr_sel = Xtr.iloc[:, keep_idx]
+    Xte_sel = Xte.iloc[:, keep_idx]
+
+    # return same type as input
+    if isinstance(X_train, pd.DataFrame):
+        return Xtr_sel, Xte_sel
+    else:
+        return Xtr_sel.values, Xte_sel.values
+
+
+
+# def feature_reduction(use_lasso,use_rfe,use_rf,use_boruta,X_train,X_test,y_train,y_test,overlap_mode="all_overlap"):
+#     print('\n')
+#     print(f'There are {X_train.shape[1]} features in the training data.')
+
+#     if use_lasso or use_rfe or use_rf or use_boruta:
+#         lasso_support_indices = []
+#         rfe_support_indices = []
+#         rf_support_indices = []
+#         boruta_support_indices = []
+
+#         # Use Lasso for feature reduction (only use features with non-zero coefficients)
+#         if use_lasso:
+#             cv = KFold(n_splits=5, shuffle=True, random_state=42)
+#             lasso = LassoCV(cv=cv).fit(X_train, y_train)
+#             coef = lasso.coef_
+#             important_features_indices = np.where(coef != 0)[0]
+#             # If X_train is a pandas DataFrame
+#             if isinstance(X_train, pd.DataFrame):
+#                 X_lasso = X_train.iloc[:, important_features_indices]
+#             else:  # Assuming X_train is a numpy array
+#                 X_lasso = X_train[:, important_features_indices]
+#             lasso_support_indices = np.where(lasso.coef_ != 0)[0]
+
+#             print('\n')
+#             print(f'Lasso regression selected {X_lasso.shape[1]} important features in the training data.')
+
+#         # Use Recursive Feature Elimination for feature reduction to a pre-set number of genes
+#         if use_rfe:
+#             model = LinearRegression()
+#             number_of_rfe_genes_to_keep = 100
+#             rfe = RFE(model, n_features_to_select=number_of_rfe_genes_to_keep)
+#             rfe.fit(X_train, y_train)
+#             X_rfe = X_train[:, rfe.support_]
+#             rfe_support_indices = np.where(rfe.support_)[0]
+
+#             print('\n')
+#             print(f'Recursive feature elimination (RFE) eliminated  all but {X_rfe.shape[1]} important features in the training data.')
+
+#         # Use Random Forest for feature reduction (select the n most important genes)
+#         if use_rf:
+#             total_rf_feature_importance = 0.5
+#             rf = RandomForestClassifier(n_estimators=1000, random_state=42)
+#             rf.fit(X_train, y_train)
+
+#             # Get feature importances and calculate the cumulative sum
+#             importances = rf.feature_importances_
+#             cumsum_importances = np.cumsum(np.sort(importances)[::-1])
+
+#             # Get the indices that would sort the importances array
+#             sorted_indices = np.argsort(importances)[::-1]
+
+#             # Get the indices for the features that make up 50% of the importance
+#             rf_support_indices = sorted_indices[:np.where(cumsum_importances > total_rf_feature_importance)[0][0]]
+
+#             print(f'\nRandom Forest selected {len(rf_support_indices)} important features in the training data with total {total_rf_feature_importance*100}% feature importance.')
+
+#         # Use Boruta for feature reduction (select the n most important genes)
+#         if use_boruta:
+#             z_score_threshold = 50
+#             rf = RandomForestClassifier(n_jobs=-1, class_weight='balanced', max_depth=5, random_state=42)
+#             boruta_selector = BorutaPy(rf, n_estimators='auto', verbose=2, random_state=42, perc=z_score_threshold)   
+#             boruta_selector.fit(X_train, y_train)
+
+#             boruta_support_indices = np.where(boruta_selector.support_)[0]
+
+#             print(f'\nBoruta selected {len(boruta_support_indices)} important features in the training data at {z_score_threshold} z-score threshold difference.')
+
+#         common_indices = get_overlapping_indices(rfe_support_indices, lasso_support_indices, rf_support_indices, boruta_support_indices, overlap_mode=overlap_mode)
+
+#         print('\n')
+#         print(f'After combining overlapping reduced features from multiple methods, {len(common_indices)} features remain.')
+
+#         if isinstance(X_train, pd.DataFrame):
+#             X_train = X_train.iloc[:, common_indices]
+#             X_test = X_test.iloc[:, common_indices]
+#         else:
+#             X_train = X_train[:, common_indices]
+#             X_test = X_test[:, common_indices]
+#         print('\n')
+#         print(f'X_train and X_test now have {X_train.shape[1]} features each from the feature reduction.')
         
-        return X_train,X_test
+#         return X_train,X_test
 
 def pca_transform(X_train, X_test, number_of_PCA_components):
     # Initialize PCA with the number of components and a random state for reproducibility

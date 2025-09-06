@@ -1113,10 +1113,30 @@ def create_keras_classifier_fn(input_dim, batch_size=32, epochs=10):
         return model
     return KerasClassifier(build_fn=model_fn, epochs=epochs, batch_size=batch_size, verbose=0, random_state=42)
 
+def make_xgb():
+    m = xgb.XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=42,
+        tree_method="hist",
+        enable_categorical=False,
+    )
+    # Some xgboost builds expose `feature_weights` in __init__ signature,
+    # which makes sklearn's get_params() try to getattr(self, 'feature_weights').
+    # Ensure it exists to avoid AttributeError during fit().
+    if not hasattr(m, "feature_weights"):
+        m.feature_weights = None
+    return m
+
 models_hyperparams = {
-    'XGBoost': {
-        'model': lambda: xgb.XGBClassifier(eval_metric='logloss', use_label_encoder=False, random_state=42),
-        'params_ranges': [{'n_estimators': n, 'max_depth': d, 'learning_rate': lr} for n in [100, 200] for d in [3, 5] for lr in [0.01, 0.1]]
+    "XGBoost": {
+        "model": make_xgb,
+        "params_ranges": [
+            {"n_estimators": n, "max_depth": d, "learning_rate": lr}
+            for n in [100, 200]
+            for d in [3, 5]
+            for lr in [0.01, 0.1]
+        ],
     },
     'CatBoost': {
         'model': lambda: cb.CatBoostClassifier(verbose=0, random_state=42),

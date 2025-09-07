@@ -6,7 +6,7 @@ import pyreadstat
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
-from sklearn.model_selection import train_test_split as tts
+from sklearn.model_selection import train_test_split as tts, StratifiedShuffleSplit
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -606,46 +606,49 @@ def filter_variables(df,dataset_option,outcome_option,exclude_variables_more_tha
 
 def custom_train_test_split(X, y, split_ratio, outcome_name='', split_by_dx_date=False):
     """
-    Split X and y dataframes into training and testing sets based on a given split ratio.
-    Optionally, split based on 'YEAR_OF_DIAGNOSIS' column if split_by_dx_date is True.
-
+    Split X and y into training and testing sets based on a given split ratio.
+    Always stratifies by the target labels.
+    
     Parameters:
-    - X (pd.DataFrame): DataFrame of predictors.
-    - y (pd.DataFrame): DataFrame of the target variable.
-    - split_ratio (list): List containing the training set percentage and the testing set percentage.
-    - split_by_dx_date (bool): Whether to split based on diagnosis year.
-
+    - X (pd.DataFrame): Predictors
+    - y (pd.Series or pd.DataFrame): Target
+    - split_ratio (list): [train%, test%] (must sum to 100)
+    - outcome_name (str): Target column name (needed if split_by_dx_date=True)
+    - split_by_dx_date (bool): If True, split chronologically by YEAR_OF_DIAGNOSIS
+    
     Returns:
-    - X_train, y_train, X_test, y_test: Split datasets.
+    - X_train, y_train, X_test, y_test
     """
     if len(split_ratio) != 2 or sum(split_ratio) != 100:
         raise ValueError("split_ratio must sum to 100 and contain two elements.")
-    
+
+    test_size = split_ratio[1] / 100.0
+
     if not split_by_dx_date:
-        test_size = split_ratio[1] / 100.0
-        X_train, X_test, y_train, y_test = tts(X, y, test_size=test_size, random_state=42)
-    else:
-        if 'YEAR_OF_DIAGNOSIS' not in X.columns:
-            raise ValueError("'YEAR_OF_DIAGNOSIS' column is required for splitting by diagnosis date.")
-        
-        # Combine X and y for sorting
-        combined = pd.concat([X, y], axis=1)
-        
-        # Sort by 'YEAR_OF_DIAGNOSIS', handling ties randomly
-        combined_sorted = combined.sample(frac=1, random_state=42).sort_values(by='YEAR_OF_DIAGNOSIS', kind='mergesort')
-        
-        # Determine the split index
-        split_index = int(len(combined_sorted) * (split_ratio[0] / 100.0))
-        
-        # Split the data
-        train = combined_sorted.iloc[:split_index, :]
-        test = combined_sorted.iloc[split_index:, :]
-        
-        # Separate predictors and target variable
-        X_train = train.drop(outcome_name, axis=1)
-        y_train = train[outcome_name]
-        X_test = test.drop(outcome_name, axis=1)
-        y_test = test[outcome_name]
+        # Simple stratified split
+        X_train, X_test, y_train, y_test = tts(X, y, test_size=test_size, random_state=42, stratify=y)
+        return X_train, y_train, X_test, y_test
+
+
+    # ---- Chronological split with stratification ----
+    if 'YEAR_OF_DIAGNOSIS' not in X.columns:
+        raise ValueError("'YEAR_OF_DIAGNOSIS' column is required for splitting by diagnosis date.")
+
+    # Combine predictors + target
+    combined = pd.concat([X, y.rename(outcome_name)], axis=1)
+
+    # Sort chronologically (breaking ties randomly for reproducibility)
+    combined = combined.sample(frac=1, random_state=42).sort_values(
+        by='YEAR_OF_DIAGNOSIS', kind='mergesort'
+    )
+
+    # Create stratified indices for train/test
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
+    for train_idx, test_idx in sss.split(combined, combined[outcome_name]):
+        train, test = combined.iloc[train_idx], combined.iloc[test_idx]
+
+    X_train, y_train = train.drop(columns=[outcome_name]), train[outcome_name]
+    X_test, y_test = test.drop(columns=[outcome_name]), test[outcome_name]
 
     return X_train, y_train, X_test, y_test
 
@@ -1222,8 +1225,8 @@ def pca_transform(X_train, X_test, number_of_PCA_components):
 
 def SMOTE_resample(X_train, X_test, y_train, y_test, sampling_strategy=0.2):
     print('\n')
-    print(f'There are {y_train.sum()} or {round(y_train.sum()/len(y_train)*100)}% positive examples of out {len(y_train)} samples in the training data.')
-    print(f'There are {y_test.sum()} or {round(y_test.sum()/len(y_test)*100)}% positive examples of out {len(y_test)} samples in the test data.')
+    print(f'There are {y_train.sum()} or {round(y_train.sum()/len(y_train)*100,2)}% positive examples of out {len(y_train)} samples in the training data.')
+    print(f'There are {y_test.sum()} or {round(y_test.sum()/len(y_test)*100,2)}% positive examples of out {len(y_test)} samples in the test data.')
 
     # Save the X-train and y-train varaiables for train dataset surival curves below
     X_train_no_SMOTE = X_train
@@ -1438,6 +1441,80 @@ def retrain_models(stacked_model, all_models, X_train, y_train):
         model.fit(X_train, y_train)  # Retrain each model
     stacked_model.fit(X_train, y_train)  # Retrain stacked model
     return stacked_model, all_models
+
+from typing import Dict, Tuple
+import numpy as np
+import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
+
+def calibrate_models(
+    trained_stacked_model,
+    trained_all_models: Dict[str, object],
+    X_val: pd.DataFrame,
+    y_val: np.ndarray,
+    method: str = "auto",
+    iso_min_pos: int = 100,
+) -> Tuple[object, Dict[str, object]]:
+    """
+    Calibrate (1) each base model in trained_all_models and (2) the final stacked predictor.
+
+    Parameters
+    ----------
+    trained_stacked_model : estimator
+        Either an sklearn StackingClassifier OR your meta-model used with base probs.
+    trained_all_models : dict[str, estimator]
+        Dict of prefit base estimators (must implement predict_proba).
+        NOTE: These calibrated wrappers are for standalone use. If your stacker was
+        trained on RAW base probs, do NOT feed calibrated base outputs to it unless
+        you retrain the stacker on calibrated base probs.
+    X_val, y_val : validation set
+        Must be at NATURAL prevalence (no SMOTE) for proper calibration.
+    method : {"auto", "sigmoid", "isotonic"}
+        - "auto": uses "sigmoid" (Platt) when positives < iso_min_pos, else "isotonic".
+        - "sigmoid": always Platt scaling.
+        - "isotonic": always isotonic regression.
+    iso_min_pos : int
+        Minimum #positives in y_val to allow isotonic; otherwise fallback to sigmoid.
+
+    Returns
+    -------
+    calibrated_stacked_model : estimator-like
+        If original is StackingClassifier: a CalibratedClassifierCV(cv="prefit").
+        Else: a lightweight wrapper with predict_proba that applies a learned
+        1D calibrator on the stacker’s raw probability.
+    calibrated_all_models : dict[str, estimator]
+        Each base model wrapped with CalibratedClassifierCV(cv="prefit").
+    """
+    y_val = np.asarray(y_val).ravel()
+    n_pos = int(y_val.sum())
+
+    if method not in {"auto", "sigmoid", "isotonic"}:
+        raise ValueError("method must be one of {'auto','sigmoid','isotonic'}")
+
+    chosen = "sigmoid"
+    if method == "isotonic":
+        chosen = "isotonic"
+    elif method == "auto":
+        chosen = "isotonic" if n_pos >= iso_min_pos else "sigmoid"
+    else:  # "sigmoid"
+        chosen = "sigmoid"
+
+    # --- 1) Calibrate each base model (for standalone use/inspection) ---
+    calibrated_all = {}
+    for name, base in trained_all_models.items():
+        cal = CalibratedClassifierCV(base, method=chosen, cv="prefit")
+        cal.fit(X_val, y_val)
+        calibrated_all[name] = cal
+
+    # --- 2) Calibrate final stack ---
+    # Directly wrap the prefit StackingClassifier
+    cal_stack = CalibratedClassifierCV(trained_stacked_model, method=chosen, cv="prefit")
+    cal_stack.fit(X_val, y_val)
+    calibrated_stacker = cal_stack
+
+    return calibrated_stacker, calibrated_all
 
 def plot_confusion_matrix(conf_matrix, class_labels, title='Confusion Matrix'):
     plt.rcParams.update({'font.size': 12})

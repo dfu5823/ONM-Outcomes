@@ -939,7 +939,6 @@ from collections import defaultdict
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from group_lasso import GroupLasso
-
 def feature_reduction(use_lasso, use_rfe, use_rf, use_boruta,
                       X_train, X_test, y_train, y_test, overlap_mode="all_overlap"):
     """
@@ -980,7 +979,6 @@ def feature_reduction(use_lasso, use_rfe, use_rf, use_boruta,
         return groups  # {group_name: [col_idx,...]}
 
     def _group_lasso_scores(Xdf, y, groups, alpha, l1_ratio):
-        # returns group -> continuous score (L2 norm of coefficients)
         gnames = list(groups.keys())
         gassign = np.zeros(Xdf.shape[1], dtype=int)
         for gi, g in enumerate(gnames):
@@ -1003,7 +1001,7 @@ def feature_reduction(use_lasso, use_rfe, use_rf, use_boruta,
         if not d: return d
         vals = np.array(list(d.values()), dtype=float)
         m, M = vals.min(), vals.max()
-        if M <= 0 or np.isclose(M, m):  # all zeros or constant
+        if M <= 0 or np.isclose(M, m):
             return {k: 0.0 for k in d}
         return {k: float((v - m) / (M - m)) for k, v in d.items()}
 
@@ -1027,9 +1025,9 @@ def feature_reduction(use_lasso, use_rfe, use_rf, use_boruta,
         print("\nNo methods selected; returning original matrices.")
         return X_train, X_test
 
-    # 1) get per-method group scores
-    method_scores = []  # list of {group: normalized_score}
-    hard_sets = []      # list of sets for overlap_mode
+    # 1) per-method group scores
+    method_scores = []
+    hard_sets = []
 
     if use_lasso:
         s_gl = _normalize(_group_lasso_scores(Xtr, y_train, groups, alpha=ALPHA_GL, l1_ratio=0.0))
@@ -1043,7 +1041,6 @@ def feature_reduction(use_lasso, use_rfe, use_rf, use_boruta,
 
     if use_rf:
         s_rf = _normalize(_rf_group_importance(Xtr, y_train, groups))
-        # quick pre-cut by cumulative importance (optional)
         if any(v > 0 for v in s_rf.values()):
             ordered = sorted(s_rf.items(), key=lambda kv: kv[1], reverse=True)
             cum, keep = 0.0, []
@@ -1054,7 +1051,7 @@ def feature_reduction(use_lasso, use_rfe, use_rf, use_boruta,
             hard_sets.append(set(keep))
         method_scores.append(s_rf)
 
-    # 2) try strict overlap if requested
+    # 2) strict overlap if requested
     if hard_sets:
         if overlap_mode == "all_overlap":
             hard = set.intersection(*hard_sets) if all(hard_sets) else set()
@@ -1063,7 +1060,7 @@ def feature_reduction(use_lasso, use_rfe, use_rf, use_boruta,
     else:
         hard = set()
 
-    # 3) build a consensus score (mean of normalized scores across available methods)
+    # 3) consensus score (mean of normalized scores)
     consensus = defaultdict(float)
     counts = defaultdict(int)
     for sd in method_scores:
@@ -1073,22 +1070,38 @@ def feature_reduction(use_lasso, use_rfe, use_rf, use_boruta,
     for g in list(consensus.keys()):
         consensus[g] /= max(1, counts[g])
 
-    # 4) choose final groups:
-    chosen = []
+    # 4) choose final groups
     if hard:
-        # rank hard set by consensus and cap to TARGET_GROUPS
         hard_ranked = _rank_topk({g: consensus.get(g, 0.0) for g in hard}, topk=max(TARGET_GROUPS, MIN_GROUPS))
         chosen = hard_ranked[:TARGET_GROUPS]
     else:
-        # fallback: global top-K by consensus (ensures <50 groups)
         chosen = _rank_topk(consensus, topk=max(TARGET_GROUPS, MIN_GROUPS))
 
-    # pad up to MIN_GROUPS if needed
-    if len(chosen) < MIN_GROUPS:
-        extras = [g for g in _rank_topk(consensus, topk=MIN_GROUPS) if g not in chosen]
-        chosen = chosen + extras
-    # cap to TARGET_GROUPS
-    chosen = chosen[:TARGET_GROUPS]
+    # --- force-keep group(s): ensure CLIN_STAGE columns are always included ---
+    FORCE_GROUP_PREFIXES = ["TNM_CLIN_STAGE_GROUP"]  # add more prefixes if needed
+
+    def _force_groups(groups, cols, prefixes):
+        forced = set()
+        for g, idxs in groups.items():
+            for i in idxs:
+                cname = str(cols[i]).replace(" ", "")
+                if any(cname.startswith(p.replace(" ", "")) for p in prefixes):
+                    forced.add(g)
+                    break
+        return forced
+
+    forced_groups = _force_groups(groups, Xtr.columns, FORCE_GROUP_PREFIXES)
+
+    if forced_groups:
+        ordered = list(dict.fromkeys(list(forced_groups) + chosen))
+        if len(ordered) > TARGET_GROUPS:
+            keep_head = list(forced_groups)
+            remaining_slots = max(TARGET_GROUPS - len(keep_head), 0)
+            rest = [g for g in ordered if g not in forced_groups][:remaining_slots]
+            chosen = keep_head + rest
+        else:
+            chosen = ordered
+    # -------------------------------------------------------------------------
 
     print(f'\nSelected {len(chosen)} groups (target {TARGET_GROUPS}).')
 
@@ -1096,7 +1109,6 @@ def feature_reduction(use_lasso, use_rfe, use_rf, use_boruta,
     Xtr_sel = Xtr.iloc[:, keep_idx]
     Xte_sel = Xte.iloc[:, keep_idx]
 
-    # return same type as input
     if isinstance(X_train, pd.DataFrame):
         return Xtr_sel, Xte_sel
     else:
@@ -1256,7 +1268,7 @@ def plot_covariance_heatmap(X_train, y_train, top_n=20):
     
     # Plot the heatmap
     plt.figure(figsize=(12, 10))
-    sns.heatmap(top_corr_matrix, annot=True, cmap='coolwarm', fmt=".2f", linewidths=.5)
+    sns.heatmap(top_corr_matrix, annot=False, cmap='coolwarm', fmt=".2f", linewidths=.5)
     plt.title(f'Top {top_n} Variables with Greatest Correlation to the Outcome')
     plt.show()
 

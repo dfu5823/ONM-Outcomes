@@ -1,8 +1,9 @@
 cloudpickle
 numpy
 pandas
-scikit-learn
+scikit-learn==1.6.1
 gradio
+xgboost
 catboost
 shap
 plotly
